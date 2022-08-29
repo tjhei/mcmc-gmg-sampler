@@ -438,7 +438,7 @@ namespace ForwardSimulator
               if (level > 0)
               {
                   smoother_data[level].smoothing_range = 15.;
-                  smoother_data[level].degree = 5;
+                  smoother_data[level].degree = 2;
                   smoother_data[level].eig_cg_n_iterations = 10;
               }
               else
