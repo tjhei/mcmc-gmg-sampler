@@ -42,6 +42,16 @@
 #include <deal.II/lac/sparse_ilu.h>
 
 #include <deal.II/numerics/data_out.h>
+#include <deal.II/matrix_free/operators.h>
+#include <deal.II/multigrid/mg_matrix.h>
+#include <deal.II/multigrid/mg_transfer.h>
+#include <deal.II/multigrid/multigrid.h>
+#include <deal.II/multigrid/mg_transfer_matrix_free.h>
+#include <deal.II/multigrid/mg_tools.h>
+#include <deal.II/multigrid/mg_coarse.h>
+#include <deal.II/multigrid/mg_smoother.h>
+#include <deal.II/multigrid/mg_matrix.h>
+
 
 #include <fstream>
 #include <iostream>
@@ -75,6 +85,400 @@ namespace ForwardSimulator
 
     virtual ~Interface() = default;
   };
+
+
+  template <int dim>
+  class MFPoissonSolver : public Interface
+  {
+  public:
+      MFPoissonSolver(const unsigned int global_refinements,
+                    const unsigned int fe_degree,
+                    const std::string &dataset_name);
+      virtual Vector<double>
+      evaluate(const Vector<double> &coefficients) override;
+
+  private:
+      void make_grid(const unsigned int global_refinements);
+      void setup_system();
+      void assemble_system(const Vector<double> &coefficients);
+      void solve();
+      void output_results(const Vector<double> &coefficients) const;
+
+      //Triangulation<dim>        triangulation;
+      parallel::distributed::Triangulation<dim> triangulation;
+
+      FE_Q<dim>                 fe;
+      DoFHandler<dim>           dof_handler;
+      AffineConstraints<double> constraints;
+
+      FullMatrix<double>        cell_matrix;
+      Vector<double>            cell_rhs;
+      std::map<types::global_dof_index,double> boundary_values;
+
+      SparsityPattern           sparsity_pattern;
+      SparseMatrix<double>      system_matrix;
+
+      Vector<double>            solution;
+      Vector<double>            system_rhs;
+      LinearAlgebra::distributed::Vector<double> rhs;
+
+      std::vector<Point<dim>>   measurement_points;
+
+      SparsityPattern           measurement_sparsity;
+      SparseMatrix<double>      measurement_matrix;
+
+      TimerOutput  timer;
+      unsigned int nth_evaluation;
+
+      const std::string &dataset_name;
+  };
+
+  template <int dim>
+  MFPoissonSolver<dim>::MFPoissonSolver(const unsigned int global_refinements,
+                                    const unsigned int fe_degree,
+                                    const std::string &dataset_name)
+      :
+      triangulation(MPI_COMM_WORLD,
+                      Triangulation<dim>::limit_level_difference_at_vertices,
+                      parallel::distributed::Triangulation<
+                          dim>::construct_multigrid_hierarchy)
+      , fe(fe_degree)
+      , dof_handler(triangulation)
+      , timer(std::cout, TimerOutput::summary, TimerOutput::cpu_times)
+      , nth_evaluation(0)
+      , dataset_name(dataset_name)
+  {
+      make_grid(global_refinements);
+      setup_system();
+  }
+
+
+
+  template <int dim>
+  void MFPoissonSolver<dim>::make_grid(const unsigned int global_refinements)
+  {
+      Assert(global_refinements >= 3,
+             ExcMessage("This program makes the assumption that the mesh for the "
+                        "solution of the PDE is at least as fine as the one used "
+                        "in the definition of the coefficient."));
+      GridGenerator::hyper_cube(triangulation, 0, 1);
+      triangulation.refine_global(global_refinements);
+
+      std::cout << "   Number of active cells: " << triangulation.n_active_cells()
+                << std::endl;
+  }
+
+
+
+  template <int dim>
+  void MFPoissonSolver<dim>::setup_system()
+  {
+      // First define the finite element space:
+      dof_handler.distribute_dofs(fe);
+      dof_handler.distribute_mg_dofs();
+
+      std::cout << "   Number of degrees of freedom: " << dof_handler.n_dofs()
+                << std::endl;
+
+
+
+      // And then define the tools to do point evaluation. We choose
+      // a set of 13x13 points evenly distributed across the domain:
+      {
+          const unsigned int n_points_per_direction = 13;
+          const double       dx = 1. / (n_points_per_direction + 1);
+
+          for (unsigned int x = 1; x <= n_points_per_direction; ++x)
+              for (unsigned int y = 1; y <= n_points_per_direction; ++y)
+                  measurement_points.emplace_back(x * dx, y * dx);
+
+          // First build a full matrix of the evaluation process. We do this
+          // even though the matrix is really sparse -- but we don't know
+          // which entries are nonzero. Later, the `copy_from()` function
+          // calls build a sparsity pattern and a sparse matrix from
+          // the dense matrix.
+          Vector<double>     weights(dof_handler.n_dofs());
+          FullMatrix<double> full_measurement_matrix(n_points_per_direction *
+                                                         n_points_per_direction,
+                                                     dof_handler.n_dofs());
+
+          for (unsigned int index = 0; index < measurement_points.size(); ++index)
+          {
+              VectorTools::create_point_source_vector(dof_handler,
+                                                      measurement_points[index],
+                                                      weights);
+              for (unsigned int i = 0; i < dof_handler.n_dofs(); ++i)
+                  full_measurement_matrix(index, i) = weights(i);
+          }
+
+          measurement_sparsity.copy_from(full_measurement_matrix);
+          measurement_matrix.reinit(measurement_sparsity);
+          measurement_matrix.copy_from(full_measurement_matrix);
+      }
+
+      // Next build the mapping from cell to the index in the 64-element
+      // coefficient vector:
+      for (const auto &cell : triangulation.active_cell_iterators())
+      {
+          const unsigned int i = std::floor(cell->center()[0] * 8);
+          const unsigned int j = std::floor(cell->center()[1] * 8);
+
+          const unsigned int index = i + 8 * j;
+
+          cell->set_user_index(index);
+      }
+
+      constraints.reinit();
+      VectorTools::interpolate_boundary_values(dof_handler,
+                                               0,
+                                               Functions::ZeroFunction<dim>(),
+                                               constraints);
+      constraints.close();
+
+
+      rhs.reinit(dof_handler.n_dofs());
+
+      // Finally prebuild the building blocks of the linear system as
+      // discussed in the Readme file:
+      {
+          const unsigned int dofs_per_cell = fe.dofs_per_cell;
+
+          cell_matrix.reinit(dofs_per_cell, dofs_per_cell);
+          cell_rhs.reinit(dofs_per_cell);
+
+          const QGauss<dim>  quadrature_formula(fe.degree+1);
+          const unsigned int n_q_points = quadrature_formula.size();
+
+          FEValues<dim> fe_values(fe,
+                                  quadrature_formula,
+                                  update_values | update_gradients |
+                                      update_JxW_values);
+
+          fe_values.reinit(dof_handler.begin_active());
+
+          for (unsigned int q_index = 0; q_index < n_q_points; ++q_index)
+              for (unsigned int i = 0; i < dofs_per_cell; ++i)
+              {
+                  for (unsigned int j = 0; j < dofs_per_cell; ++j)
+                      cell_matrix(i, j) +=
+                          (fe_values.shape_grad(i, q_index) * // grad phi_i(x_q)
+                           fe_values.shape_grad(j, q_index) * // grad phi_j(x_q)
+                           fe_values.JxW(q_index));           // dx
+
+                  cell_rhs(i) += (fe_values.shape_value(i, q_index) * // phi_i(x_q)
+                                  10.0 *                              // f(x_q)
+                                  fe_values.JxW(q_index));            // dx
+              }
+
+          std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
+          for (auto & cell : dof_handler.active_cell_iterators())
+          {
+              cell->get_dof_indices(local_dof_indices);
+              constraints.distribute_local_to_global(cell_rhs, local_dof_indices, rhs);
+          }
+
+          VectorTools::interpolate_boundary_values(dof_handler,
+                                                   0,
+                                                   Functions::ZeroFunction<dim>(),
+                                                   boundary_values);
+      }
+  }
+
+  template <int dim>
+  Vector<double>
+  MFPoissonSolver<dim>::evaluate(const Vector<double> &coefficients)
+  {
+      Assert(fe.degree == 1, ExcNotImplemented());
+      const int fe_degree = 1;
+
+      std::shared_ptr<MatrixFree<dim, double>> mf_data(
+          new MatrixFree<dim, double>());
+
+      {
+          const QGauss<1>                                  quad(fe_degree + 1);
+          typename MatrixFree<dim, double>::AdditionalData data;
+          data.tasks_parallel_scheme = MatrixFree<dim, double>::AdditionalData::none;
+          data.tasks_block_size      = 7;
+          mf_data->reinit(MappingQ1<dim>(), dof_handler, constraints, quad, data);
+      }
+
+      std::shared_ptr<Table<2, VectorizedArray<double> > > coefficient =
+          std::make_shared<Table<2, VectorizedArray<double> > >();
+
+
+      {
+     //   FEEvaluation<dim,fe_degree,n_q_points_1d,1,double> fe_eval(mf_data);
+
+     const unsigned int n_cells = mf_data->n_cell_batches();
+   coefficient->reinit(n_cells, 1); // constant per cell
+
+      }
+
+      using VectorType = LinearAlgebra::distributed::Vector<double>;
+
+      using OperatorType =
+      MatrixFreeOperators::LaplaceOperator<
+          dim,
+          fe_degree,
+          fe_degree + 1,
+          1,
+           VectorType
+              >;
+
+      OperatorType mf;
+
+      mf.initialize(mf_data);
+      mf.set_coefficient(coefficient);
+
+
+//      mf_data->initialize_dof_vector(in);
+
+
+      {
+          TimerOutput::Scope section(timer, "Building linear systems");
+
+          const unsigned int n_cells = mf_data->n_cell_batches();
+          for (unsigned int cell=0; cell<n_cells; ++cell)
+          {
+              for (unsigned int lane = 0 ; lane < VectorizedArray<double>::size(); ++lane)
+              {
+                  (*coefficient)(cell,0)[lane]
+                      =
+                          coefficients[
+                              mf_data->get_cell_iterator(cell, lane)->user_index()];
+              }
+          }
+
+      }
+
+      VectorType solution;
+      mf.initialize_dof_vector(solution);
+      //mf.compute_diagonal();
+
+
+      MappingQ1<dim> mapping;
+
+      //setup gmg
+      MGConstrainedDoFs mg_constrained_dofs;
+      const std::set<types::boundary_id> dirichlet_boundary_ids = {0};
+      mg_constrained_dofs.initialize(dof_handler);
+      mg_constrained_dofs.make_zero_boundary_constraints(dof_handler,
+                                                         dirichlet_boundary_ids);
+
+      using LevelMatrixType = OperatorType; // try <float>
+      MGLevelObject<LevelMatrixType> mg_matrices;
+
+      {
+          const unsigned int n_levels = triangulation.n_global_levels();
+          mg_matrices.clear_elements();
+          mg_matrices.resize(0, n_levels-1);
+
+          for (unsigned int level = 0; level < n_levels; ++level)
+          {
+              AffineConstraints<double> level_constraints;
+              level_constraints.add_lines(mg_constrained_dofs.get_boundary_indices(level));
+              level_constraints.close();
+
+              typename MatrixFree<dim, double>::AdditionalData additional_data;
+              additional_data.tasks_parallel_scheme =
+                  MatrixFree<dim, double>::AdditionalData::none;
+              additional_data.mapping_update_flags = (update_gradients | update_JxW_values | update_quadrature_points);
+              additional_data.mg_level = level;
+              std::shared_ptr<MatrixFree<dim, double>> mg_mf_storage_level(
+                  new MatrixFree<dim, double>());
+
+              mg_mf_storage_level->reinit(mapping,
+                                          dof_handler,
+                                          level_constraints,
+                                          QGauss<1>(fe_degree + 1),
+                                          additional_data);
+              mg_matrices[level].clear();
+              mg_matrices[level].initialize(mg_mf_storage_level,
+                                            mg_constrained_dofs,
+                                            level);
+          }
+
+          MGTransferMatrixFree<dim, double> mg_transfer(mg_constrained_dofs);
+          mg_transfer.build(dof_handler);
+
+          // smoother
+
+          using SmootherType =
+              PreconditionChebyshev<OperatorType, dealii::LinearAlgebra::distributed::Vector<double>>;
+
+          mg::SmootherRelaxation<SmootherType, dealii::LinearAlgebra::distributed::Vector<double>> mg_smoother;
+
+          MGLevelObject<typename SmootherType::AdditionalData> smoother_data;
+          smoother_data.resize(0, n_levels - 1);
+          for (unsigned int level = 0; level < n_levels;
+               ++level)
+          {
+              if (level > 0)
+              {
+                  smoother_data[level].smoothing_range = 15.;
+                  smoother_data[level].degree = 5;
+                  smoother_data[level].eig_cg_n_iterations = 10;
+              }
+              else
+              {
+                  // On level zero, we initialize the smoother differently
+                  // because we want to use the Chebyshev iteration as a solver.
+                  smoother_data[0].smoothing_range = 1e-3;
+                  smoother_data[0].degree = numbers::invalid_unsigned_int;
+                  smoother_data[0].eig_cg_n_iterations = mg_matrices[0].m();
+              }
+              mg_matrices[level].compute_diagonal();
+              smoother_data[level].preconditioner =
+                  mg_matrices[level].get_matrix_diagonal_inverse();
+          }
+          mg_smoother.initialize(mg_matrices, smoother_data);
+          MGCoarseGridApplySmoother<dealii::LinearAlgebra::distributed::Vector<double>> mg_coarse;
+          mg_coarse.initialize(mg_smoother);
+
+    mg::Matrix<LinearAlgebra::distributed::Vector<double>> mg_matrix(
+      mg_matrices);
+
+      Multigrid<dealii::LinearAlgebra::distributed::Vector<double>> mg(mg_matrix, mg_coarse, mg_transfer, mg_smoother, mg_smoother);
+    //  mg.set_edge_matrices(mg_interface, mg_interface);
+      PreconditionMG<dim,
+                     dealii::LinearAlgebra::distributed::Vector<double>,
+                     MGTransferMatrixFree<dim, double>>
+          preconditioner(dof_handler, mg, mg_transfer);
+
+
+          TimerOutput::Scope section(timer, "Solving linear systems");
+
+  //        PreconditionJacobi<OperatorType> prec;
+//          prec.initialize(mf);
+
+          SolverControl control(1000, 1e-10*rhs.l2_norm());
+          SolverCG<VectorType> solver(control);
+
+          solver.solve(mf, solution, rhs, preconditioner);
+
+          std::cout << "converged in " << control.last_step() << std::endl;
+      }
+
+      Vector<double> measurements(measurement_matrix.m());
+      {
+          TimerOutput::Scope section(timer, "Postprocessing");
+
+          Vector<double> solcopy(dof_handler.n_dofs());
+          for (unsigned int n=0;n<dof_handler.n_dofs(); ++n)
+              solcopy(n) = solution(n);
+          measurement_matrix.vmult(measurements, solcopy);
+          Assert(measurements.size() == measurement_points.size(),
+                 ExcInternalError());
+
+          /*  output_results(coefficients);  */
+      }
+
+      ++nth_evaluation;
+      if (nth_evaluation % 10000 == 0)
+          timer.print_summary();
+
+      return measurements;
+  }
 
 
 
@@ -736,7 +1140,7 @@ namespace Sampler
 //                                       /* prefix = */ "exact")
 //      .evaluate(exact_coefficients);
 // @endcode
-int main()
+int main(int argc, char *argv[])
 {
   const bool testing = true;
 
@@ -744,7 +1148,8 @@ int main()
   // doing the same at the same time. It turns out that the problem
   // is also so small that running with more than one thread
   // *increases* the runtime.
-  MultithreadInfo::set_thread_limit(1);
+  //MultithreadInfo::set_thread_limit(1);
+  Utilities::MPI::MPI_InitFinalize mpi_init(argc, argv, 1);
 
   const unsigned int random_seed  = (testing ? 1U : std::random_device()());
   const std::string  dataset_name = Utilities::to_string(random_seed, 10);
@@ -837,15 +1242,21 @@ int main()
         0.1067965550010013                         });
 
   // Now run the forward simulator for samples:
-  ForwardSimulator::PoissonSolver<2> laplace_problem(
-    /* global_refinements = */ 5,
-    /* fe_degree = */ 1,
-    dataset_name);
+//  ForwardSimulator::PoissonSolver<2> laplace_problem(
+//    /* global_refinements = */ 5,
+//    /* fe_degree = */ 1,
+//    dataset_name);
+  ForwardSimulator::MFPoissonSolver<2> mf_laplace_problem(
+      /* global_refinements = */ 5,
+      /* fe_degree = */ 1,
+      dataset_name);
+
+
   LogLikelihood::Gaussian        log_likelihood(exact_solution, 0.05);
   LogPrior::LogGaussian          log_prior(0, 2);
   ProposalGenerator::LogGaussian proposal_generator(
     random_seed, 0.09); /* so that the acceptance ratio is ~0.24 */
-  Sampler::MetropolisHastings sampler(laplace_problem,
+  Sampler::MetropolisHastings sampler(mf_laplace_problem,
                                       log_likelihood,
                                       log_prior,
                                       proposal_generator,
@@ -856,7 +1267,8 @@ int main()
   for (auto &el : starting_coefficients)
     el = 1.;
   sampler.sample(starting_coefficients,
-                 (testing ? 250 * 40 /* takes 40 seconds */
+                 (testing ? 250 * 4
+		  //250 * 40  /* takes 40 seconds */
                             :
                             100000000 /* takes 6 days */
                   ));
