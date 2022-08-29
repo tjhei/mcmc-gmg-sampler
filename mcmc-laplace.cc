@@ -218,7 +218,7 @@ namespace ForwardSimulator
 
       // Next build the mapping from cell to the index in the 64-element
       // coefficient vector:
-      for (const auto &cell : triangulation.active_cell_iterators())
+      for (const auto &cell : triangulation.cell_iterators())
       {
           const unsigned int i = std::floor(cell->center()[0] * 8);
           const unsigned int j = std::floor(cell->center()[1] * 8);
@@ -353,7 +353,7 @@ namespace ForwardSimulator
 
       VectorType solution;
       mf.initialize_dof_vector(solution);
-      //mf.compute_diagonal();
+      mf.compute_diagonal();
 
 
       MappingQ1<dim> mapping;
@@ -396,6 +396,28 @@ namespace ForwardSimulator
               mg_matrices[level].initialize(mg_mf_storage_level,
                                             mg_constrained_dofs,
                                             level);
+	      
+
+	      std::shared_ptr<Table<2, VectorizedArray<double> > > coefficient =
+          std::make_shared<Table<2, VectorizedArray<double> > >();
+
+	      const unsigned int n_cells = mg_mf_storage_level->n_cell_batches();
+	      coefficient->reinit(n_cells, 1); // constant per cell
+	      mg_matrices[level].set_coefficient(coefficient);
+	      {
+		for (unsigned int cell=0; cell<n_cells; ++cell)
+		  {
+		    unsigned int n_lanes = mg_mf_storage_level->n_active_entries_per_cell_batch(cell);
+		    for (unsigned int lane = 0 ; lane < n_lanes; ++lane)
+		      {
+			(*coefficient)(cell,0)[lane]
+			  =
+                          coefficients[
+				       mg_mf_storage_level->get_cell_iterator(cell, lane)->user_index()];
+		      }
+		  }
+	      }
+      
           }
 
           MGTransferMatrixFree<dim, double> mg_transfer(mg_constrained_dofs);
@@ -445,18 +467,15 @@ namespace ForwardSimulator
                      MGTransferMatrixFree<dim, double>>
           preconditioner(dof_handler, mg, mg_transfer);
 
-
           TimerOutput::Scope section(timer, "Solving linear systems");
-
-  //        PreconditionJacobi<OperatorType> prec;
-//          prec.initialize(mf);
 
           SolverControl control(1000, 1e-10*rhs.l2_norm());
           SolverCG<VectorType> solver(control);
 
+	  solution = 0;
           solver.solve(mf, solution, rhs, preconditioner);
 
-          std::cout << "converged in " << control.last_step() << std::endl;
+	  //          std::cout << "converged in " << control.last_step() << std::endl;
       }
 
       Vector<double> measurements(measurement_matrix.m());
@@ -1242,10 +1261,10 @@ int main(int argc, char *argv[])
         0.1067965550010013                         });
 
   // Now run the forward simulator for samples:
-//  ForwardSimulator::PoissonSolver<2> laplace_problem(
-//    /* global_refinements = */ 5,
-//    /* fe_degree = */ 1,
-//    dataset_name);
+  ForwardSimulator::PoissonSolver<2> laplace_problem(
+    /* global_refinements = */ 5,
+    /* fe_degree = */ 1,
+    dataset_name);
   ForwardSimulator::MFPoissonSolver<2> mf_laplace_problem(
       /* global_refinements = */ 5,
       /* fe_degree = */ 1,
@@ -1257,6 +1276,7 @@ int main(int argc, char *argv[])
   ProposalGenerator::LogGaussian proposal_generator(
     random_seed, 0.09); /* so that the acceptance ratio is ~0.24 */
   Sampler::MetropolisHastings sampler(mf_laplace_problem,
+				      //laplace_problem,
                                       log_likelihood,
                                       log_prior,
                                       proposal_generator,
@@ -1267,8 +1287,8 @@ int main(int argc, char *argv[])
   for (auto &el : starting_coefficients)
     el = 1.;
   sampler.sample(starting_coefficients,
-                 (testing ? 250 * 4
-		  //250 * 40  /* takes 40 seconds */
+                 (testing ? 
+		  250 * 40  /* takes 40 seconds */
                             :
                             100000000 /* takes 6 days */
                   ));
