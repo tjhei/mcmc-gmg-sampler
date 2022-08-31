@@ -177,6 +177,8 @@ namespace ForwardSimulator
       dof_handler.distribute_dofs(fe);
       dof_handler.distribute_mg_dofs();
 
+      solution.reinit(dof_handler.n_dofs());
+
       std::cout << "   Number of degrees of freedom: " << dof_handler.n_dofs()
                 << std::endl;
 
@@ -351,8 +353,13 @@ namespace ForwardSimulator
 
       }
 
-      VectorType solution;
-      mf.initialize_dof_vector(solution);
+      VectorType mf_solution;
+      mf.initialize_dof_vector(mf_solution);
+
+      // copy solution
+      for (unsigned int n = 0; n < dof_handler.n_dofs(); ++n)
+        mf_solution(n) = solution(n);
+
       mf.compute_diagonal();
 
 
@@ -438,7 +445,7 @@ namespace ForwardSimulator
               if (level > 0)
               {
                   smoother_data[level].smoothing_range = 15.;
-                  smoother_data[level].degree = 2;
+                  smoother_data[level].degree = 1;
                   smoother_data[level].eig_cg_n_iterations = 10;
               }
               else
@@ -466,26 +473,24 @@ namespace ForwardSimulator
                      dealii::LinearAlgebra::distributed::Vector<double>,
                      MGTransferMatrixFree<dim, double>>
           preconditioner(dof_handler, mg, mg_transfer);
+      {
+        TimerOutput::Scope section(timer, "Solving linear systems");
 
-          TimerOutput::Scope section(timer, "Solving linear systems");
+        SolverControl control(1000, 1e-10 * rhs.l2_norm());
+        SolverCG<VectorType> solver(control);
 
-          SolverControl control(1000, 1e-10*rhs.l2_norm());
-          SolverCG<VectorType> solver(control);
-
-	  solution = 0;
-          solver.solve(mf, solution, rhs, preconditioner);
-
+        solver.solve(mf, mf_solution, rhs, preconditioner);
 	  //          std::cout << "converged in " << control.last_step() << std::endl;
+      }
       }
 
       Vector<double> measurements(measurement_matrix.m());
       {
           TimerOutput::Scope section(timer, "Postprocessing");
 
-          Vector<double> solcopy(dof_handler.n_dofs());
           for (unsigned int n=0;n<dof_handler.n_dofs(); ++n)
-              solcopy(n) = solution(n);
-          measurement_matrix.vmult(measurements, solcopy);
+              solution(n) = mf_solution(n);
+          measurement_matrix.vmult(measurements, solution);
           Assert(measurements.size() == measurement_points.size(),
                  ExcInternalError());
 
